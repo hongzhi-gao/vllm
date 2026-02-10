@@ -1189,6 +1189,112 @@ def use_trtllm_ragged_deepseek_prefill() -> bool:
     return is_deepseek_r1_mla_compatible(vllm_config)
 
 
+def use_mla_prefill_sdpa_fallback() -> bool:
+    """Whether to use the Python/SDPA prefill fallback for MLA (Turing only).
+
+    FlashAttention does not support Turing (SM 75). When this returns True we
+    use a Python-level fallback based on torch.nn.functional.scaled_dot_product_attention
+    (or manual attention when LSE is required for chunked prefill merge). Slower than
+    FlashAttention but enables MLA prefill on Turing. Only active when (MLA model)
+    and (Turing GPU) and (prefill stage).
+    """
+    return current_platform.get_device_capability() == (7, 5)
+
+
+def _causal_mask_sdpa_fallback(
+    len_q: int,
+    len_k: int,
+    causal: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Build causal attention mask (0.0 / -inf) for SDPA fallback. None if not causal."""
+    if not causal:
+        return None
+    if len_q == len_k:
+        return torch.triu(
+            torch.full((len_q, len_k), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+    r = torch.arange(len_q, device=device, dtype=torch.long)[:, None]
+    c = torch.arange(len_k, device=device, dtype=torch.long)[None, :]
+    return torch.where(
+        c <= r, torch.zeros((), device=device, dtype=dtype), float("-inf")
+    )
+
+
+def _mla_prefill_varlen_sdpa_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    scale: float,
+    causal: bool,
+    return_lse: bool,
+    cu_seqlens_k: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Python-only varlen prefill for MLA using SDPA or manual attention.
+
+    Used only on Turing where FlashAttention is unavailable. Performance:
+    per-sequence loop + SDPA is slower than FlashAttention; when return_lse is True
+    we use manual attention (scores + softmax) because SDPA does not expose LSE
+    needed for merge_attn_states in chunked prefill.
+
+    q/k/v: [total, num_heads, head_dim]; v may have smaller head_dim (MLA).
+    cu_seqlens_q: [num_seqs+1]. cu_seqlens_k optional for context chunk.
+    Returns (o, lse) with lse [num_heads, total] when return_lse else o only.
+    """
+    F = torch.nn.functional
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    num_heads = q.shape[1]
+    kv_group = num_heads // k.shape[1]
+    device, dtype = q.device, q.dtype
+
+    out_list: list[torch.Tensor] = []
+    lse_list: list[torch.Tensor] = [] if return_lse else None
+
+    for i in range(num_seqs):
+        start_q = int(cu_seqlens_q[i].item())
+        end_q = int(cu_seqlens_q[i + 1].item())
+        len_q = end_q - start_q
+        if cu_seqlens_k is not None:
+            start_k = int(cu_seqlens_k[i].item())
+            end_k = int(cu_seqlens_k[i + 1].item())
+        else:
+            start_k, end_k = start_q, end_q
+        len_k = end_k - start_k
+
+        q_i = q[start_q:end_q]
+        k_i = k[start_k:end_k]
+        v_i = v[start_k:end_k]
+        if kv_group > 1:
+            k_i = k_i.repeat_interleave(kv_group, dim=1)
+            v_i = v_i.repeat_interleave(kv_group, dim=1)
+
+        mask = _causal_mask_sdpa_fallback(len_q, len_k, causal, device, dtype)
+
+        if return_lse:
+            scores = torch.matmul(q_i, k_i.transpose(-2, -1)) * scale
+            if mask is not None:
+                scores = scores + mask
+            lse_i = torch.logsumexp(scores.float(), dim=-1).to(dtype)
+            p = F.softmax(scores, dim=-1)
+            o_i = torch.matmul(p, v_i)
+            out_list.append(o_i)
+            lse_list.append(lse_i)
+        else:
+            o_i = F.scaled_dot_product_attention(
+                q_i, k_i, v_i, attn_mask=mask, scale=scale
+            )
+            out_list.append(o_i)
+
+    out = torch.cat(out_list, dim=0)
+    if return_lse and lse_list is not None:
+        lse = torch.cat(lse_list, dim=0)
+        return out, lse.t().contiguous()
+    return out
+
+
 @dataclass
 class MLADims:
     q_lora_rank: int | None
@@ -1926,6 +2032,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_cudnn
             self._pad_v = False
+        elif use_mla_prefill_sdpa_fallback():
+            logger.info_once(
+                "Using Python SDPA fallback for MLA prefill (Turing GPU; "
+                "FlashAttention does not support Turing)",
+                scope="local",
+            )
+            self._run_prefill_context_chunk = (
+                self._run_prefill_context_chunk_sdpa_fallback
+            )
+            self._run_prefill_new_tokens = self._run_prefill_new_tokens_sdpa_fallback
+            self._pad_v = False
         else:  # Use FlashAttention
             if flash_attn_varlen_func is None:
                 raise RuntimeError(
@@ -2061,6 +2178,39 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if return_softmax_lse:
             return output, lse
         return output
+
+    def _run_prefill_new_tokens_sdpa_fallback(
+        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+    ):
+        ret = _mla_prefill_varlen_sdpa_fallback(
+            q,
+            k,
+            v,
+            prefill.query_start_loc,
+            self.scale,
+            causal=True,
+            return_lse=return_softmax_lse,
+            cu_seqlens_k=None,
+        )
+        if return_softmax_lse:
+            return ret[0], ret[1]
+        return ret
+
+    def _run_prefill_context_chunk_sdpa_fallback(
+        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
+    ):
+        assert prefill.chunked_context is not None
+        o, lse = _mla_prefill_varlen_sdpa_fallback(
+            q,
+            k,
+            v,
+            prefill.query_start_loc,
+            self.scale,
+            causal=False,
+            return_lse=True,
+            cu_seqlens_k=prefill.chunked_context.cu_seq_lens[chunk_idx],
+        )
+        return o, lse
 
     def _run_prefill_context_chunk_fa(
         self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
